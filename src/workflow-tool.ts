@@ -1,4 +1,9 @@
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  createCodingTools,
+  createReadOnlyTools,
+  defineTool,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -41,6 +46,9 @@ const workflowDisplayOptions = {
 export interface WorkflowToolOptions {
   cwd?: string;
   concurrency?: number;
+  maxAgents?: number;
+  allowWrites?: boolean | (() => boolean);
+  autoApprove?: boolean | (() => boolean);
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
@@ -48,7 +56,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     name: "workflow",
     label: "Workflow",
     description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
+      "Execute reviewed JavaScript that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
+      "The script runs only after user approval, is capped at 100 agents, and subagents are read-only unless Pi starts with --workflow-write-tools.",
       "script is required raw JavaScript. It must start with export const meta = { name, description } and must call agent() at least once; phases are optional metadata.",
     ].join(" "),
     promptSnippet:
@@ -57,13 +66,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
       "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
-      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
+      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date(). The script is shown to the user for approval before it runs.",
       "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
       "For workflow, call phase(title) when a new group of work starts. Phase names may be conditional or built in a loop; do not predeclare speculative phases just in case.",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
       "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
       "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
+      "For workflow, opts.model performs real per-agent routing and must use provider/model format. Do not use opts.isolation; worktree isolation is not implemented and is rejected rather than simulated.",
       "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
       "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
@@ -74,8 +84,33 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return normalizeWorkflowToolArgs(args);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
-      const parsed = parseWorkflowScript(script);
+      let script = normalizeWorkflowScript(params.script);
+      let parsed = parseWorkflowScript(script);
+      const allowWrites = resolveOption(options.allowWrites, false);
+      const autoApprove = resolveOption(options.autoApprove, false);
+
+      if (!autoApprove) {
+        if (!ctx.hasUI) {
+          throw new Error(
+            "Workflow approval requires an interactive session; start Pi with --workflow-auto-approve to opt in for non-interactive runs",
+          );
+        }
+        const reviewedScript = await ctx.ui.editor(`Review workflow JavaScript: ${parsed.meta.name}`, script);
+        if (reviewedScript === undefined) throw new Error("Workflow review was canceled");
+        script = normalizeWorkflowScript(reviewedScript);
+        parsed = parseWorkflowScript(script);
+        const approved = await ctx.ui.confirm(
+          `Run workflow: ${parsed.meta.name}?`,
+          [
+            parsed.meta.description,
+            `Subagent tools: ${allowWrites ? "read/write/shell" : "read-only"}`,
+            `Maximum agents: ${options.maxAgents ?? 100}`,
+            "The reviewed JavaScript runs in Node's vm and must be treated as trusted code.",
+          ].join("\n"),
+        );
+        if (!approved) throw new Error("Workflow was not approved");
+      }
+
       let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta);
       const display = createToolUpdateWorkflowDisplay(onUpdate, undefined, workflowDisplayOptions);
 
@@ -96,8 +131,21 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           args: params.args,
           signal,
           concurrency: options.concurrency,
+          maxAgents: options.maxAgents,
+          tools: allowWrites ? createCodingTools(options.cwd ?? ctx.cwd) : createReadOnlyTools(options.cwd ?? ctx.cwd),
+          resolveModel(requestedModel) {
+            const separator = requestedModel.indexOf("/");
+            if (separator <= 0 || separator === requestedModel.length - 1) {
+              throw new Error(`agent model must use provider/model format: ${requestedModel}`);
+            }
+            const model = ctx.modelRegistry.find(
+              requestedModel.slice(0, separator),
+              requestedModel.slice(separator + 1),
+            );
+            if (!model) throw new Error(`unknown or unavailable agent model: ${requestedModel}`);
+            return model;
+          },
           session: {
-            modelRegistry: ctx.modelRegistry,
             model: ctx.model,
           },
           onLog(message) {
@@ -172,7 +220,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           logs: result.logs,
           result: result.result,
           durationMs: result.durationMs,
+          usage: result.usage,
         },
+        usage: result.usage,
       };
     },
     renderCall(_args, theme) {
@@ -201,6 +251,10 @@ function normalizeWorkflowScript(script: string): string {
   const fence = text.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
   if (fence) text = fence[1].trim();
   return text;
+}
+
+function resolveOption(value: boolean | (() => boolean) | undefined, fallback: boolean): boolean {
+  return typeof value === "function" ? value() : (value ?? fallback);
 }
 
 function isAbortError(error: unknown): boolean {

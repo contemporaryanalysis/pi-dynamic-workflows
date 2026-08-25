@@ -22,7 +22,21 @@ Then in Pi:
 /reload
 ```
 
-That's it. The extension registers a `workflow` tool and activates it on session start.
+The extension registers a `workflow` tool and activates it on session start. Every generated script is shown for approval before execution. Subagents are read-only by default.
+
+To deliberately allow write and shell tools:
+
+```bash
+pi --workflow-write-tools
+```
+
+For trusted non-interactive automation, approval can be bypassed explicitly:
+
+```bash
+pi -p --workflow-auto-approve "Run a workflow to inspect this repository"
+```
+
+`--workflow-auto-approve` treats model-generated JavaScript as trusted code and should not be enabled casually.
 
 ## Usage
 
@@ -96,18 +110,13 @@ This declares `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `cwd`, an
 | `log(message)` | Append a workflow-level log line. |
 | `args` | Optional JSON value passed in via the tool's `args` parameter. |
 | `cwd`, `process.cwd()` | Current working directory for subagents. |
-| `budget` | `{ total, spent(), remaining() }` token budget tracker. |
+| `budget` | `{ total, spent(), remaining() }` token budget tracker backed by actual nested-agent usage when a budget is configured. |
 
-### Determinism rules
+### Execution and trust model
 
-Workflow scripts are evaluated inside a Node `vm` sandbox. The following are intentionally unavailable:
+Workflow scripts are evaluated inside a restricted Node `vm` context. **Node's `vm` is not a security boundary**, so generated scripts must be treated as trusted code. Interactive runs therefore require explicit script approval, and non-interactive runs are rejected unless `--workflow-auto-approve` is set.
 
-- `Date.now()`, `new Date()`
-- `Math.random()`
-- `require`, `import`, `fs`, network APIs
-- spreads, computed keys, template interpolation, function calls inside `meta`
-
-This keeps `meta` parseable, runs reproducible, and the surface area small.
+The parser rejects nondeterministic APIs such as `Date.now()`, `new Date()`, and `Math.random()`. It also keeps metadata literal and parseable by rejecting spreads, computed metadata keys, template interpolation, and function calls inside `meta`. These checks improve reproducibility; they do not turn the runtime into a security sandbox.
 
 ### Structured subagent output
 
@@ -141,7 +150,9 @@ user prompt
   → final structured result returned to the parent assistant
 ```
 
-Subagents run in fresh in-memory Pi sessions with the standard coding tools, so they can read files, run shell commands, and call structured output exactly like a normal Pi turn.
+Subagents run in fresh in-memory Pi sessions. They receive read-only tools by default. Starting Pi with `--workflow-write-tools` gives them the standard coding tools, including file mutation and shell execution. Parallel write agents share the same checkout, so target files must be disjoint.
+
+Per-agent model routing is supported with `{ model: "provider/model" }`. Worktree isolation is not implemented; `{ isolation: "worktree" }` is rejected instead of silently pretending to isolate changes.
 
 ## Library modules
 
@@ -164,9 +175,18 @@ npm run dev
 
 Parser unit tests live in `tests/workflow-parser.test.ts` and cover both accepted and rejected script shapes.
 
+## Safety limits
+
+- Maximum 16 concurrently running agents.
+- Maximum 100 agents over the lifetime of one workflow.
+- Generated scripts require interactive approval by default.
+- Subagents are read-only unless `--workflow-write-tools` is supplied.
+- Nested model usage and cost are included in Pi's tool usage accounting.
+- A workflow failure aborts and drains outstanding subagents before returning.
+
 ## Status
 
-This is a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output) but does not yet implement persisted or resumable runs, or a `/workflows` manager.
+This is still a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output), approval and basic execution limits, but does not yet implement persisted or resumable runs or a `/workflows` manager.
 
 ## License
 
