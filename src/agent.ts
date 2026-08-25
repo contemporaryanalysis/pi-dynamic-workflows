@@ -1,4 +1,4 @@
-import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
+import type { AssistantMessage, TextContent, Usage } from "@earendil-works/pi-ai";
 import {
   type CreateAgentSessionOptions,
   createAgentSession,
@@ -26,7 +26,9 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   schema?: TSchemaDef;
   tools?: ToolDefinition[];
   instructions?: string;
+  model?: CreateAgentSessionOptions["model"];
   signal?: AbortSignal;
+  onUsage?: (usage: Usage) => void;
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -63,8 +65,10 @@ export class WorkflowAgent {
       agentDir,
       sessionManager: SessionManager.inMemory(this.cwd),
       settingsManager: SettingsManager.create(this.cwd, agentDir),
-      customTools,
       ...this.sessionOptions,
+      customTools,
+      tools: customTools.map((tool) => tool.name),
+      ...(options.model ? { model: options.model } : {}),
     });
 
     let removeAbortListener: (() => void) | undefined;
@@ -78,6 +82,7 @@ export class WorkflowAgent {
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
+      options.onUsage?.(this.aggregateUsage(session.messages));
 
       if (options.schema) {
         if (!capture.called) {
@@ -114,6 +119,32 @@ export class WorkflowAgent {
     }
 
     return parts.join("\n\n");
+  }
+
+  private aggregateUsage(messages: unknown[]): Usage {
+    const total: Usage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    for (const message of messages) {
+      const usage = (message as Partial<AssistantMessage> | undefined)?.usage;
+      if (!usage) continue;
+      total.input += usage.input;
+      total.output += usage.output;
+      total.cacheRead += usage.cacheRead;
+      total.cacheWrite += usage.cacheWrite;
+      total.totalTokens += usage.totalTokens;
+      total.cost.input += usage.cost.input;
+      total.cost.output += usage.cost.output;
+      total.cost.cacheRead += usage.cost.cacheRead;
+      total.cost.cacheWrite += usage.cost.cacheWrite;
+      total.cost.total += usage.cost.total;
+    }
+    return total;
   }
 
   private lastAssistantText(messages: unknown[]): string {

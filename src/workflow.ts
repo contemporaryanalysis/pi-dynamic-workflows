@@ -1,4 +1,5 @@
 import vm from "node:vm";
+import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
@@ -21,7 +22,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: Pick<WorkflowAgent, "run">;
   concurrency?: number;
+  maxAgents?: number;
   tokenBudget?: number | null;
+  resolveModel?: (model: string) => Model<Api>;
   signal?: AbortSignal;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
@@ -36,6 +39,7 @@ export interface WorkflowRunResult<T = unknown> {
   phases: string[];
   agentCount: number;
   durationMs: number;
+  usage: Usage;
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -53,6 +57,7 @@ interface RuntimeState {
   phases: string[];
   agentCount: number;
   spent: number;
+  usage: Usage;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -66,14 +71,23 @@ export async function runWorkflow<T = unknown>(
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
-  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, spent: 0 };
+  const state: RuntimeState = {
+    logs: [],
+    phases: [],
+    agentCount: 0,
+    spent: 0,
+    usage: emptyUsage(),
+  };
   const agentRunner = options.agent ?? new WorkflowAgent(options);
   const concurrency = Math.max(
     1,
     Math.min(options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2), 16),
   );
+  const maxAgents = Math.max(1, Math.min(options.maxAgents ?? 100, 1000));
   const limiter = createLimiter(concurrency);
   const pendingAgentRuns = new Set<Promise<unknown>>();
+  const runAbort = new AbortController();
+  const runSignal = options.signal ? AbortSignal.any([options.signal, runAbort.signal]) : runAbort.signal;
 
   const log = (message: string) => {
     const text = String(message);
@@ -95,34 +109,36 @@ export async function runWorkflow<T = unknown>(
   });
 
   const throwIfAborted = () => {
-    if (options.signal?.aborted) throw new Error("workflow aborted");
+    if (runSignal.aborted) throw new Error("workflow aborted");
   };
 
-  const agent = async (prompt: unknown, agentOptions: unknown = {}) => {
+  const agent = (prompt: unknown, agentOptions: unknown = {}) => {
     throwIfAborted();
     if (budget.total !== null && budget.remaining() <= 0) throw new Error("workflow token budget exhausted");
+    if (state.agentCount >= maxAgents) throw new Error(`workflow agent limit exceeded (${maxAgents})`);
     const taskPrompt = requireString(prompt, "agent prompt");
     const normalizedOptions = normalizeAgentOptions(agentOptions);
     const assignedPhase = normalizedOptions.phase ?? state.currentPhase;
     const requestedLabel = normalizedOptions.label?.trim();
+    const agentNumber = ++state.agentCount;
     const run = limiter(async () => {
-      state.agentCount++;
-      const label = requestedLabel || defaultAgentLabel(assignedPhase, state.agentCount);
+      const label = requestedLabel || defaultAgentLabel(assignedPhase, agentNumber);
       options.onAgentStart?.({ label, phase: assignedPhase, prompt: taskPrompt });
       try {
         throwIfAborted();
         const result = await agentRunner.run(taskPrompt, {
           label,
           schema: normalizedOptions.schema,
-          signal: options.signal,
+          model: normalizedOptions.model ? options.resolveModel?.(normalizedOptions.model) : undefined,
+          signal: runSignal,
           instructions: buildAgentInstructions(assignedPhase, normalizedOptions),
+          onUsage: (usage: Usage) => addUsage(state, usage),
         } as any);
         throwIfAborted();
-        state.spent += estimateTokens(result);
         options.onAgentEnd?.({ label, phase: assignedPhase, result });
         return result;
       } catch (error) {
-        if (options.signal?.aborted) throw error;
+        if (runSignal.aborted) throw error;
         log(`agent ${label} failed: ${error instanceof Error ? error.message : String(error)}`);
         options.onAgentEnd?.({ label, phase: assignedPhase, result: null });
         return null;
@@ -147,7 +163,7 @@ export async function runWorkflow<T = unknown>(
         try {
           return await thunk();
         } catch (error) {
-          if (options.signal?.aborted) throw error;
+          if (runSignal.aborted) throw error;
           log(`parallel[${index}] failed: ${error instanceof Error ? error.message : String(error)}`);
           return null;
         }
@@ -173,7 +189,7 @@ export async function runWorkflow<T = unknown>(
             value = await stage(value, item, index);
             throwIfAborted();
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (runSignal.aborted) throw error;
             log(`pipeline[${index}] failed: ${error instanceof Error ? error.message : String(error)}`);
             return null;
           }
@@ -212,17 +228,24 @@ export async function runWorkflow<T = unknown>(
   });
 
   const wrapped = `(async () => {\n${body}\n})()`;
-  const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
-  await Promise.allSettled([...pendingAgentRuns]);
-  assertStructuredCloneable(result, "workflow result");
-  return {
-    meta,
-    result: result as T,
-    logs: state.logs,
-    phases: state.phases,
-    agentCount: state.agentCount,
-    durationMs: Date.now() - started,
-  };
+  try {
+    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    await Promise.allSettled([...pendingAgentRuns]);
+    assertStructuredCloneable(result, "workflow result");
+    return {
+      meta,
+      result: result as T,
+      logs: state.logs,
+      phases: state.phases,
+      agentCount: state.agentCount,
+      durationMs: Date.now() - started,
+      usage: state.usage,
+    };
+  } catch (error) {
+    runAbort.abort();
+    await Promise.allSettled([...pendingAgentRuns]);
+    throw error;
+  }
 }
 
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
@@ -416,12 +439,15 @@ function optionalString(value: unknown, name: string): string | undefined {
 function normalizeAgentOptions(value: unknown): AgentOptions {
   if (!value || typeof value !== "object") throw new TypeError("agent options must be an object");
   const options = value as AgentOptions;
+  if (options.isolation !== undefined) {
+    throw new Error("agent isolation is not implemented; use disjoint targets or a separately sandboxed checkout");
+  }
   return {
     ...options,
     label: optionalString(options.label, "agent label"),
     phase: optionalString(options.phase, "agent phase"),
     model: optionalString(options.model, "agent model"),
-    isolation: options.isolation,
+    isolation: undefined,
     agentType: optionalString(options.agentType, "agent type"),
   };
 }
@@ -445,11 +471,31 @@ function buildAgentInstructions(phase: string | undefined, options: AgentOptions
   const lines = [];
   if (phase) lines.push(`Workflow phase: ${phase}`);
   if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`);
-  if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`);
-  if (options.model) lines.push(`Requested model: ${options.model}`);
+  if (options.model) lines.push(`Selected model: ${options.model}`);
   return lines.length ? lines.join("\n") : undefined;
 }
 
-function estimateTokens(value: unknown): number {
-  return Math.ceil(JSON.stringify(value ?? "").length / 4);
+function emptyUsage(): Usage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function addUsage(state: RuntimeState, usage: Usage): void {
+  state.usage.input += usage.input;
+  state.usage.output += usage.output;
+  state.usage.cacheRead += usage.cacheRead;
+  state.usage.cacheWrite += usage.cacheWrite;
+  state.usage.totalTokens += usage.totalTokens;
+  state.usage.cost.input += usage.cost.input;
+  state.usage.cost.output += usage.cost.output;
+  state.usage.cost.cacheRead += usage.cost.cacheRead;
+  state.usage.cost.cacheWrite += usage.cost.cacheWrite;
+  state.usage.cost.total += usage.cost.total;
+  state.spent += usage.totalTokens;
 }
