@@ -26,5 +26,13 @@ export type {
   WorkflowRunResult,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export type { SavedWorkflow, WorkflowScope } from "./workflow-store.js";
+export {
+  getWorkflowDirectories,
+  listSavedWorkflows,
+  loadSavedWorkflow,
+  saveWorkflow,
+  validateWorkflowName,
+} from "./workflow-store.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { createWorkflowTool } from "./workflow-tool.js";
