@@ -49,6 +49,7 @@ export interface WorkflowToolOptions {
   maxAgents?: number;
   allowWrites?: boolean | (() => boolean);
   autoApprove?: boolean | (() => boolean);
+  onScriptPrepared?: (script: string) => void;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
@@ -86,6 +87,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       let script = normalizeWorkflowScript(params.script);
       let parsed = parseWorkflowScript(script);
+      options.onScriptPrepared?.(script);
       const allowWrites = resolveOption(options.allowWrites, false);
       const autoApprove = resolveOption(options.autoApprove, false);
 
@@ -99,6 +101,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         if (reviewedScript === undefined) throw new Error("Workflow review was canceled");
         script = normalizeWorkflowScript(reviewedScript);
         parsed = parseWorkflowScript(script);
+        options.onScriptPrepared?.(script);
         const approved = await ctx.ui.confirm(
           `Run workflow: ${parsed.meta.name}?`,
           [

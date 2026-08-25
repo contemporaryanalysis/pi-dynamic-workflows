@@ -59,6 +59,35 @@ The model will write a workflow script and call the `workflow` tool. Live progre
 
 Press `Esc` to cancel a running workflow. Active subagents are aborted and surfaced as skipped.
 
+## Save, run, and share workflows
+
+The extension provides three native commands:
+
+```text
+/workflow-save [name] [--project|--user]
+/workflow-run <name> [JSON args]
+/workflows
+```
+
+`/workflow-save` opens the latest generated/reviewed script, or a starter template when no workflow has run yet. Project scope is the default:
+
+- Project workflows: `<git-root>/.pi/workflows/*.js`
+- User workflows: `~/.pi/agent/workflows/*.js`
+
+Project workflows can be committed and shared with coworkers. A project workflow with the same name overrides a user workflow. Project workflows are only discovered in trusted projects and still go through the normal script-review and confirmation flow.
+
+Examples:
+
+```text
+/workflow-save cross-model-review
+/workflow-save personal-audit --user
+/workflow-run cross-model-review
+/workflow-run cross-model-review {"paths":["src","tests"]}
+/workflows
+```
+
+`/workflows` opens a selector and places the corresponding `/workflow-run` command in the editor. Coworkers need this extension, provider credentials, and access to every model named by the saved script.
+
 ## Workflow script shape
 
 A workflow is plain JavaScript. The first statement must export literal metadata. `name` and `description` are required; `phases` is optional documentation for an expected outline. The live progress view is driven by `phase(...)` calls at runtime:
@@ -186,7 +215,7 @@ Parser unit tests live in `tests/workflow-parser.test.ts` and cover both accepte
 
 ## Status
 
-This is still a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output), approval and basic execution limits, but does not yet implement persisted or resumable runs or a `/workflows` manager.
+This is still a prototype. It implements the core workflow primitive (script, subagents, parallel/pipeline, phases, abort, structured output), approval, basic execution limits, and reusable user/project workflow commands. It does not yet persist run checkpoints or resume interrupted workflows.
 
 ## License
 
